@@ -1,6 +1,7 @@
 import asyncio
 import cv2
 import mediapipe as mp
+from mediapipe import solutions as mps
 import numpy as np
 import json
 import websockets
@@ -153,6 +154,55 @@ class ExpressionSmoother:
         return smoothed
 
 
+class FrameCounter:
+    def __init__(self):
+        self.count = 0
+        self.start_time = time.time()
+        self.fps = 0.0
+        self._show_frame_count = True
+        self._show_fps = True
+
+    def increment(self):
+        self.count += 1
+        elapsed_time = time.time() - self.start_time
+        if elapsed_time > 0:
+            self.fps = self.count / elapsed_time
+
+    def get_count(self):
+        return self.count
+
+    def get_fps(self):
+        return round(self.fps, 2)
+
+    def show_frame_count(self, show: bool):
+        self._show_frame_count = show
+
+    def show_fps(self, show: bool):
+        self._show_fps = show
+
+    def draw(self, frame):
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        color = (0, 255, 0)
+        thickness = 1
+
+        if self._show_frame_count:
+            frame_text = f"Frame: {self.get_count()}"
+            position_frame = (10, 20)  # Top-left for frame count
+            cv2.putText(
+                frame, frame_text, position_frame, font, font_scale, color, thickness
+            )
+
+        if self._show_fps:
+            fps_text = f"FPS: {self.get_fps()}"
+            position_fps = (10, 40)  # Below frame count for FPS
+            cv2.putText(
+                frame, fps_text, position_fps, font, font_scale, color, thickness
+            )
+
+        return frame
+
+
 class MediaPipeClient:
     def __init__(self, camera_index, ws_uri, user_id):
         self.camera_index = camera_index
@@ -168,6 +218,7 @@ class MediaPipeClient:
         self.last_analysis_time = 0
         self.min_analysis_interval = 0.1  # Minimum time between analyses (seconds)
         self.expr_smoother = ExpressionSmoother(window_size=2)
+        self.frame_counter = FrameCounter()
 
     def extract_expressions_simple(self, face_landmarks):
         def dist(a, b):
@@ -296,6 +347,7 @@ class MediaPipeClient:
                 refine_face_landmarks=True,
             ) as holistic:
                 while self.cap.isOpened():
+                    self.frame_counter.increment()
                     success, frame = self.cap.read()
                     if not success:
                         print("Ignoring empty camera frame.")
@@ -327,31 +379,47 @@ class MediaPipeClient:
                             print("Sent:", json.dumps(payload))
 
                     debug_frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                    self.frame_counter.draw(debug_frame)
 
                     if results.face_landmarks:
-                        self.mp_drawing.draw_landmarks(
+                        # self.mp_drawing.draw_landmarks(
+                        #     debug_frame,
+                        #     results.face_landmarks,
+                        #     self.mp_holistic.FACEMESH_CONTOURS,
+                        # )
+
+                        mps.drawing_utils.draw_landmarks(
                             debug_frame,
-                            results.face_landmarks,
-                            self.mp_holistic.FACEMESH_CONTOURS,
+                            results.pose_landmarks,
+                            mps.holistic.POSE_CONNECTIONS,
+                            landmark_drawing_spec=mps.drawing_styles.get_default_pose_landmarks_style(),
                         )
 
+                        # self.mp_drawing.draw_landmarks(
+                        #     debug_frame,
+                        #     results.face_landmarks,
+                        #     self.mp_holistic.FACEMESH_TESSELATION,
+                        #     landmark_drawing_spec=None,
+                        #     connection_drawing_spec=mps.drawing_styles.get_default_face_mesh_tesselation_style(),
+                        # )
+
                         # debug_frame = cv2.flip(debug_frame, 1)  # Flip first
-                        for idx, landmark in enumerate(results.face_landmarks.landmark):
-                            h, w, _ = debug_frame.shape
-                            x = int(
-                                (landmark.x) * w
-                            )  # Flip X manually since image is flipped
-                            y = int(landmark.y * h)
-                            cv2.putText(
-                                debug_frame,
-                                str(idx),
-                                (x, y),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.3,
-                                (0, 255, 0),
-                                1,
-                                cv2.LINE_AA,
-                            )
+                        # for idx, landmark in enumerate(results.face_landmarks.landmark):
+                        #     h, w, _ = debug_frame.shape
+                        #     x = int(
+                        #         (landmark.x) * w
+                        #     )  # Flip X manually since image is flipped
+                        #     y = int(landmark.y * h)
+                        #     cv2.putText(
+                        #         debug_frame,
+                        #         str(idx),
+                        #         (x, y),
+                        #         cv2.FONT_HERSHEY_SIMPLEX,
+                        #         0.3,
+                        #         (0, 255, 0),
+                        #         1,
+                        #         cv2.LINE_AA,
+                        #     )
 
                         cv2.imshow("MediaPipe Face", debug_frame)
                     if cv2.waitKey(1) & 0xFF == 27:
