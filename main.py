@@ -1,7 +1,6 @@
 import asyncio
 import cv2
 import mediapipe as mp
-from mediapipe import solutions as mps
 import numpy as np
 import json
 import websockets
@@ -9,6 +8,7 @@ import click
 import time
 from deepface import DeepFace
 from collections import defaultdict, deque
+from scipy.spatial.transform import Rotation as R
 
 
 def normalize_dict(d, fn):
@@ -77,8 +77,6 @@ def estimate_head_quaternion_from_pose(results):
     rot_mat = np.stack([shoulder_dir, up_dir, -forward_dir], axis=1)
 
     # Convert to quaternion
-    from scipy.spatial.transform import Rotation as R
-
     rot = R.from_matrix(rot_mat)
     quat = rot.as_quat()  # returns [x, y, z, w]
 
@@ -203,22 +201,36 @@ class FrameCounter:
         return frame
 
 
-class MediaPipeClient:
-    def __init__(self, camera_index, ws_uri, user_id):
-        self.camera_index = camera_index
-        self.ws_uri = ws_uri
-        self.user_id = user_id
-        self.mp_holistic = mp.solutions.holistic
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.cap = cv2.VideoCapture(self.camera_index)
-        # Initialize emotion detection variables
-        self.frame_skip = 3  # Analyze every 3rd frame
-        self.frame_count = 0
-        self.last_emotion_result = None
-        self.last_analysis_time = 0
-        self.min_analysis_interval = 0.1  # Minimum time between analyses (seconds)
+class HeadPoseComponent:
+    def process(self, results, **kwargs):
+        if not results.pose_world_landmarks:
+            return None
+        quat = estimate_head_quaternion_from_pose(results)
+        return {"rotation": quat} if quat else None
+
+
+class IrisMovementComponent:
+    def process(self, results, frame_rgb, **kwargs):
+        if not results.face_landmarks:
+            return None
+        h, w, _ = frame_rgb.shape
+        iris_data = extract_iris_movement(results.face_landmarks, w, h)
+        return {"iris": iris_data}
+
+
+class ExpressionsComponent:
+    def __init__(self, simple=False):
         self.expr_smoother = ExpressionSmoother(window_size=2)
-        self.frame_counter = FrameCounter()
+        self.simple = simple
+
+    def process(self, results, **kwargs):
+        if not results.face_landmarks:
+            return None
+        if self.simple:
+            expr_data = self.extract_expressions_simple(results.face_landmarks)
+        else:
+            expr_data = self.extract_expressions(results.face_landmarks)
+        return {"blend": expr_data}
 
     def extract_expressions_simple(self, face_landmarks):
         def dist(a, b):
@@ -291,8 +303,27 @@ class MediaPipeClient:
 
         return self.expr_smoother.smooth(expr)
 
-    def detect_emotions(self, frame):
-        """Optimized emotion detection using DeepFace."""
+
+class EmotionDetectionComponent:
+    def __init__(self):
+        self.frame_skip = 3
+        self.frame_count = 0
+        self.last_emotion_result = None
+        self.last_analysis_time = 0
+        self.min_analysis_interval = 0.1
+
+    def process(self, results, frame_bgr_flipped, **kwargs):
+        face_landmarks = results.face_landmarks if results else None
+        emotion_result = self.detect_emotions(frame_bgr_flipped, face_landmarks)
+        if emotion_result:
+            return {
+                "emotion": emotion_result.get("emotion"),
+                "dominant_emotion": emotion_result.get("dominant_emotion"),
+            }
+        return None
+
+    def detect_emotions(self, frame, face_landmarks=None):
+        """Optimized emotion detection using DeepFace with face cropping."""
         current_time = time.time()
         self.frame_count += 1
 
@@ -304,8 +335,27 @@ class MediaPipeClient:
             return self.last_emotion_result
 
         try:
-            # Resize frame for faster processing
-            small_frame = cv2.resize(frame, (320, 240))
+            # Crop to face bounding box if landmarks are available
+            if face_landmarks:
+                # Calculate bounding box from face landmarks
+                h, w, _ = frame.shape
+                x_coords = [landmark.x for landmark in face_landmarks.landmark]
+                y_coords = [landmark.y for landmark in face_landmarks.landmark]
+
+                x1 = max(0, int(min(x_coords) * w) - 20)  # Add small padding
+                y1 = max(0, int(min(y_coords) * h) - 20)
+                x2 = min(w, int(max(x_coords) * w) + 20)
+                y2 = min(h, int(max(y_coords) * h) + 20)
+
+                # Crop the frame to the face region
+                cropped_frame = frame[y1:y2, x1:x2]
+                if cropped_frame.size == 0:  # If crop is invalid, use original frame
+                    cropped_frame = frame
+            else:
+                cropped_frame = frame
+
+            # Resize cropped frame for faster processing
+            small_frame = cv2.resize(cropped_frame, (320, 240))
             # Analyze emotion
             result = DeepFace.analyze(
                 small_frame,
@@ -338,6 +388,44 @@ class MediaPipeClient:
         except Exception:
             return self.last_emotion_result
 
+
+class ShoulderTrackingComponent:
+    def process(self, results, **kwargs):
+        if not results.pose_world_landmarks:
+            return None
+
+        landmarks = results.pose_world_landmarks.landmark
+
+        left_shoulder = landmarks[mp.solutions.holistic.PoseLandmark.LEFT_SHOULDER]
+        right_shoulder = landmarks[mp.solutions.holistic.PoseLandmark.RIGHT_SHOULDER]
+
+        shoulders_data = {
+            "left": {
+                "x": left_shoulder.x,
+                "y": left_shoulder.y,
+                "z": left_shoulder.z,
+            },
+            "right": {
+                "x": right_shoulder.x,
+                "y": right_shoulder.y,
+                "z": right_shoulder.z,
+            },
+        }
+
+        return {"shoulders": shoulders_data}
+
+
+class MediaPipeClient:
+    def __init__(self, camera_index, ws_uri, user_id, components):
+        self.camera_index = camera_index
+        self.ws_uri = ws_uri
+        self.user_id = user_id
+        self.components = components
+        self.mp_holistic = mp.solutions.holistic
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.cap = cv2.VideoCapture(self.camera_index)
+        self.frame_counter = FrameCounter()
+
     async def run(self):
         print(f"Connecting to WebSocket server at {self.ws_uri}")
         async with websockets.connect(self.ws_uri) as websocket:
@@ -357,24 +445,21 @@ class MediaPipeClient:
                     frame_rgb = cv2.flip(frame_rgb, 1)
                     frame_rgb.flags.writeable = False
                     results = holistic.process(frame_rgb)
+                    frame_bgr_flipped = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-                    if results.face_landmarks:
-                        expr_data = self.extract_expressions(results.face_landmarks)
-                        # Perform optimized emotion detection
-                        emotion_result = self.detect_emotions(frame)
-                        if emotion_result:
-                            payload = {
-                                "id": self.user_id,
-                                "iris": extract_iris_movement(
-                                    results.face_landmarks,
-                                    frame.shape[1],
-                                    frame.shape[0],
-                                ),
-                                "rotation": estimate_head_quaternion_from_pose(results),
-                                "blend": expr_data,
-                                "emotion": emotion_result["emotion"],
-                                "dominant_emotion": emotion_result["dominant_emotion"],
-                            }
+                    payload = {"id": self.user_id}
+
+                    if results.face_landmarks or results.pose_world_landmarks:
+                        for component in self.components:
+                            component_data = component.process(
+                                results=results,
+                                frame_rgb=frame_rgb,
+                                frame_bgr_flipped=frame_bgr_flipped,
+                            )
+                            if component_data:
+                                payload.update(component_data)
+
+                        if len(payload) > 1:
                             await websocket.send(json.dumps(payload))
                             print("Sent:", json.dumps(payload))
 
@@ -382,45 +467,13 @@ class MediaPipeClient:
                     self.frame_counter.draw(debug_frame)
 
                     if results.face_landmarks:
-                        # self.mp_drawing.draw_landmarks(
-                        #     debug_frame,
-                        #     results.face_landmarks,
-                        #     self.mp_holistic.FACEMESH_CONTOURS,
-                        # )
-
-                        mps.drawing_utils.draw_landmarks(
-                            debug_frame,
-                            results.pose_landmarks,
-                            mps.holistic.POSE_CONNECTIONS,
-                            landmark_drawing_spec=mps.drawing_styles.get_default_pose_landmarks_style(),
-                        )
-
-                        # self.mp_drawing.draw_landmarks(
-                        #     debug_frame,
-                        #     results.face_landmarks,
-                        #     self.mp_holistic.FACEMESH_TESSELATION,
-                        #     landmark_drawing_spec=None,
-                        #     connection_drawing_spec=mps.drawing_styles.get_default_face_mesh_tesselation_style(),
-                        # )
-
-                        # debug_frame = cv2.flip(debug_frame, 1)  # Flip first
-                        # for idx, landmark in enumerate(results.face_landmarks.landmark):
-                        #     h, w, _ = debug_frame.shape
-                        #     x = int(
-                        #         (landmark.x) * w
-                        #     )  # Flip X manually since image is flipped
-                        #     y = int(landmark.y * h)
-                        #     cv2.putText(
-                        #         debug_frame,
-                        #         str(idx),
-                        #         (x, y),
-                        #         cv2.FONT_HERSHEY_SIMPLEX,
-                        #         0.3,
-                        #         (0, 255, 0),
-                        #         1,
-                        #         cv2.LINE_AA,
-                        #     )
-
+                        if results.pose_landmarks:
+                            mp.solutions.drawing_utils.draw_landmarks(
+                                debug_frame,
+                                results.pose_landmarks,
+                                mp.solutions.holistic.POSE_CONNECTIONS,
+                                landmark_drawing_spec=mp.solutions.drawing_styles.get_default_pose_landmarks_style(),
+                            )
                         cv2.imshow("MediaPipe Face", debug_frame)
                     if cv2.waitKey(1) & 0xFF == 27:
                         break
@@ -436,9 +489,31 @@ class MediaPipeClient:
 )
 @click.option("--port", default=8082, help="WebSocket server port (default: 8081)")
 @click.option("--user-id", required=True, help="User/Character ID to send to Godot")
-def main(camera, host, port, user_id):
+@click.option(
+    "--emotion-detection",
+    is_flag=True,
+    default=False,
+    help="Enable emotion detection.",
+)
+def main(camera, host, port, user_id, emotion_detection):
     ws_uri = f"ws://{host}:{port}"
-    client = MediaPipeClient(camera_index=camera, ws_uri=ws_uri, user_id=user_id)
+
+    components = [
+        HeadPoseComponent(),
+        IrisMovementComponent(),
+        ExpressionsComponent(),
+        # ShoulderTrackingComponent(),
+    ]
+
+    if emotion_detection:
+        components.append(EmotionDetectionComponent())
+
+    client = MediaPipeClient(
+        camera_index=camera,
+        ws_uri=ws_uri,
+        user_id=user_id,
+        components=components,
+    )
     asyncio.run(client.run())
 
 
